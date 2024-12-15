@@ -7,6 +7,7 @@
 #include <type_traits>
 #include <iostream>
 #include <Eigen/Core>
+#include <Eigen/SparseCore>
 
 namespace rehline {
 
@@ -67,6 +68,43 @@ void reset_fv_set(std::vector<std::pair<Index, Index>>& fvset, std::size_t n, st
         fvset[i] = std::make_pair(i % n, i / n);
 }
 
+// Determining the types of some matrices based on the input type
+// MatrixType may be dense or sparse matrices, with row or column majors
+template <typename MatrixType>
+struct traits
+{
+    // In case MatrixType is an Eigen::Ref or Eigen::Map,
+    // get its underlying matrix type
+    using PlainMatrix = typename MatrixType::PlainObject;
+
+    // Scalar type
+    using Scalar = typename PlainMatrix::Scalar;
+
+    // Determining whether the matrix is dense or sparse, row- or column-majored
+    enum {
+        IsSparse = std::is_same<typename PlainMatrix::StorageKind, Eigen::Sparse>::value,
+        IsRowMajor = PlainMatrix::IsRowMajor
+    };
+
+    // We really want some matrices to be row-majored, since they can be more
+    // efficient in certain matrix operations, for example X.row(i).dot(v)
+    //
+    // Dense row-majored matrix type
+    using DenseRMatrix = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    // Sparse row-majored matrix type
+    using SparseRMatrix = Eigen::SparseMatrix<Scalar, Eigen::RowMajor>;
+    // If the given matrix is already row-majored, we save a const reference;
+    // otherwise we make a copy
+    using RMatrix = typename std::conditional<
+        IsRowMajor,
+        Eigen::Ref<const PlainMatrix>,
+        typename std::conditional<IsSparse, SparseRMatrix, DenseRMatrix>::type
+    >::type;
+
+    // Sometimes we need a dense matrix with the same row/column major as the given matrix
+    using DenseMatrix = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic, IsRowMajor ? Eigen::RowMajor : Eigen::ColMajor>;
+};
+
 
 }  // namespace internal
 // ========================= Internal utility functions ========================= //
@@ -91,9 +129,13 @@ void reset_fv_set(std::vector<std::pair<Index, Index>>& fvset, std::size_t n, st
 //   * Gamma : [H x n]
 
 // Results of the optimization algorithm
-template <typename Matrix = Eigen::MatrixXd, typename Index = int>
+// MatrixType should be a dense matrix type
+template <typename MatrixType = Eigen::MatrixXd, typename Index = int>
 struct ReHLineResult
 {
+    // In case MatrixType is an Eigen::Ref or Eigen::Map,
+    // get its underlying matrix type
+    using Matrix = typename MatrixType::PlainObject;
     using Scalar = typename Matrix::Scalar;
     using Vector = Eigen::Matrix<Scalar, Eigen::Dynamic, 1>;
 
@@ -107,14 +149,26 @@ struct ReHLineResult
 };
 
 // The main ReHLine solver
-// "Matrix" is the type of input data matrix, can be row-majored or column-majored
-template <typename Matrix = Eigen::MatrixXd, typename Index = int>
+// "DMatrix" is the type of dense matrices (U, V, S, T, Tau)
+// "XMatrix" is the type of input data matrix, can be dense/sparse and row/column-majored
+// "AMatrix" is the type of constraint matrix, can be dense/sparse and row/column-majored
+template <typename DMatrix = Eigen::MatrixXd,
+          typename XMatrix = Eigen::MatrixXd,
+          typename AMatrix = Eigen::MatrixXd,
+          typename Index = int>
 class ReHLineSolver
 {
 private:
+    // Const reference of D, X, and A
+    using ConstRefDMat = Eigen::Ref<const typename DMatrix::PlainObject>;
+    using ConstRefXMat = Eigen::Ref<const typename XMatrix::PlainObject>;
+    using ConstRefAMat = Eigen::Ref<const typename AMatrix::PlainObject>;
+
+    // The Matrix type is used for intermediate objects and dual variables
+    // Make its row/column major consistent with (U, V, S, T, Tau)
+    using Matrix = typename DMatrix::PlainObject;
     using Scalar = typename Matrix::Scalar;
     using Vector = Eigen::Matrix<Scalar, Eigen::Dynamic, 1>;
-    using ConstRefMat = Eigen::Ref<const Matrix>;
     using ConstRefVec = Eigen::Ref<const Vector>;
 
     // We really want some matrices to be row-majored, since they can be more
@@ -122,11 +176,8 @@ private:
     //
     // If the data Matrix is already row-majored, we save a const reference;
     // otherwise we make a copy
-    using RMatrix = typename std::conditional<
-        Matrix::IsRowMajor,
-        Eigen::Ref<const Matrix>,
-        Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
-    >::type;
+    using XRMatrix = typename internal::traits<XMatrix>::RMatrix;
+    using ARMatrix = typename internal::traits<AMatrix>::RMatrix;
 
     // RNG
     internal::SimpleRNG<Index> m_rng;
@@ -139,14 +190,14 @@ private:
     const Index m_K;
 
     // Input matrices and vectors
-    RMatrix     m_X;
-    ConstRefMat m_U;
-    ConstRefMat m_V;
-    ConstRefMat m_S;
-    ConstRefMat m_T;
-    ConstRefMat m_Tau;
-    RMatrix     m_A;
-    ConstRefVec m_b;
+    XRMatrix     m_X;
+    ConstRefDMat m_U;
+    ConstRefDMat m_V;
+    ConstRefDMat m_S;
+    ConstRefDMat m_T;
+    ConstRefDMat m_Tau;
+    ARMatrix     m_A;
+    ConstRefVec  m_b;
 
     // Pre-computed
     Vector m_gk_denom;   // ||a[k]||^2
@@ -289,7 +340,7 @@ private:
             const Scalar newxi = std::max(Scalar(0), candid);
             // Update xi and beta
             m_xi[k] = newxi;
-            m_beta.noalias() += (newxi - xi_k) * m_A.row(k).transpose();
+            m_beta += (newxi - xi_k) * m_A.row(k).transpose();
         }
     }
 
@@ -314,7 +365,7 @@ private:
                 const Scalar newl = std::max(Scalar(0), std::min(Scalar(1), candid));
                 // Update Lambda and beta
                 m_Lambda(l, i) = newl;
-                m_beta.noalias() -= (newl - lambda_li) * u_li * m_X.row(i).transpose();
+                m_beta -= (newl - lambda_li) * u_li * m_X.row(i).transpose();
             }
         }
     }
@@ -342,7 +393,7 @@ private:
                 const Scalar newg = std::max(Scalar(0), std::min(tau_hi, candid));
                 // Update Gamma and beta
                 m_Gamma(h, i) = newg;
-                m_beta.noalias() -= (newg - gamma_hi) * s_hi * m_X.row(i).transpose();
+                m_beta -= (newg - gamma_hi) * s_hi * m_X.row(i).transpose();
             }
         }
     }
@@ -403,7 +454,7 @@ private:
             const Scalar newxi = std::max(Scalar(0), candid);
             // Update xi and beta
             m_xi[k] = newxi;
-            m_beta.noalias() += (newxi - xi_k) * m_A.row(k).transpose();
+            m_beta += (newxi - xi_k) * m_A.row(k).transpose();
 
             // Add to new free variable set
             new_set.push_back(k);
@@ -470,7 +521,7 @@ private:
             const Scalar newl = std::max(Scalar(0), std::min(Scalar(1), candid));
             // Update Lambda and beta
             m_Lambda(l, i) = newl;
-            m_beta.noalias() -= (newl - lambda_li) * u_li * m_X.row(i).transpose();
+            m_beta -= (newl - lambda_li) * u_li * m_X.row(i).transpose();
 
             // Add to new free variable set
             new_set.emplace_back(l, i);
@@ -539,7 +590,7 @@ private:
             const Scalar newg = std::max(Scalar(0), std::min(tau_hi, candid));
             // Update Gamma and beta
             m_Gamma(h, i) = newg;
-            m_beta.noalias() -= (newg - gamma_hi) * s_hi * m_X.row(i).transpose();
+            m_beta -= (newg - gamma_hi) * s_hi * m_X.row(i).transpose();
 
             // Add to new free variable set
             new_set.emplace_back(h, i);
@@ -550,9 +601,9 @@ private:
     }
 
 public:
-    ReHLineSolver(ConstRefMat X, ConstRefMat U, ConstRefMat V,
-                  ConstRefMat S, ConstRefMat T, ConstRefMat Tau,
-                  ConstRefMat A, ConstRefVec b) :
+    ReHLineSolver(ConstRefXMat X, ConstRefDMat U, ConstRefDMat V,
+                  ConstRefDMat S, ConstRefDMat T, ConstRefDMat Tau,
+                  ConstRefAMat A, ConstRefVec b) :
         m_n(X.rows()), m_d(X.cols()), m_L(U.rows()), m_H(S.rows()), m_K(A.rows()),
         m_X(X), m_U(U), m_V(V), m_S(S), m_T(T), m_Tau(Tau), m_A(A), m_b(b),
         m_gk_denom(m_K), m_gli_denom(m_L, m_n), m_ghi_denom(m_H, m_n),
@@ -561,9 +612,26 @@ public:
     {
         // A [K x d], K can be zero
         if (m_K > 0)
-            m_gk_denom.noalias() = m_A.rowwise().squaredNorm();
+        {
+            // If m_A is a sparse matrix, it does not have a rowwise() function
+            //
+            // m_gk_denom.noalias() = m_A.rowwise().squaredNorm();
+            //
+            for (Index i = 0; i < m_K; i++)
+            {
+                m_gk_denom.coeffRef(i) = m_A.row(i).squaredNorm();
+            }
+        }
 
-        Vector xi2 = m_X.rowwise().squaredNorm();
+        // If m_X is a sparse matrix, it does not have a rowwise() function
+        //
+        // Vector xi2 = m_X.rowwise().squaredNorm();
+        Vector xi2(m_n);
+        for (Index i = 0; i < m_n; i++)
+        {
+            xi2.coeffRef(i) = m_X.row(i).squaredNorm();
+        }
+
         if (m_L > 0)
         {
             m_gli_denom.array() = m_U.array().square().rowwise() * xi2.transpose().array();
@@ -600,7 +668,7 @@ public:
     }
 
     // Warm start: set dual variables to be the given ones
-    inline void warmstart_params(ConstRefVec xi_ws, ConstRefMat Lambda_ws, ConstRefMat Gamma_ws)
+    inline void warmstart_params(ConstRefVec xi_ws, ConstRefDMat Lambda_ws, ConstRefDMat Gamma_ws)
     {
         // Warmstart parameters
         if (m_K > 0)
@@ -806,11 +874,14 @@ public:
 
 
 // Main solver interface
-// template <typename Matrix = Eigen::MatrixXd, typename Index = int>
-template <typename DerivedMat, typename DerivedVec, typename Index = int>
+template <typename DerivedMat,
+          typename DerivedVec,
+          typename DerivedX,
+          typename DerivedA,
+          typename Index = int>
 void rehline_solver(
     ReHLineResult<typename DerivedMat::PlainObject, Index>& result,
-    const Eigen::MatrixBase<DerivedMat>& X, const Eigen::MatrixBase<DerivedMat>& A,
+    const Eigen::EigenBase<DerivedX>& X, const Eigen::EigenBase<DerivedA>& A,
     const Eigen::MatrixBase<DerivedVec>& b,
     const Eigen::MatrixBase<DerivedMat>& U, const Eigen::MatrixBase<DerivedMat>& V,
     const Eigen::MatrixBase<DerivedMat>& S, const Eigen::MatrixBase<DerivedMat>& T, const Eigen::MatrixBase<DerivedMat>& Tau,
@@ -819,8 +890,13 @@ void rehline_solver(
     std::ostream& cout = std::cout
 )
 {
+    using MatType = typename DerivedMat::PlainObject;
+    using XType = typename DerivedX::PlainObject;
+    using AType = typename DerivedA::PlainObject;
+    using Scalar = typename DerivedMat::Scalar;
+
     // Create solver
-    ReHLineSolver<typename DerivedMat::PlainObject, Index> solver(X, U, V, S, T, Tau, A, b);
+    ReHLineSolver<MatType, XType, AType, Index> solver(X.derived(), U, V, S, T, Tau, A.derived(), b);
 
     // Initialize parameters
     try
@@ -838,8 +914,8 @@ void rehline_solver(
     }
 
     // Main iterations
-    std::vector<typename DerivedMat::Scalar> dual_objfns;
-    std::vector<typename DerivedMat::Scalar> primal_objfns;
+    std::vector<Scalar> dual_objfns;
+    std::vector<Scalar> primal_objfns;
     Index niter;
     if (shrink > 0)
     {
